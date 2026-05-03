@@ -1,0 +1,147 @@
+set:
+  name: Set alarm
+  description: Create or replace a wake-up alarm. Schedules itself via Simple Cue.
+  fields:
+    name:
+      name: Name
+      description: Unique slug, e.g. weekday_wakeup.
+      required: true
+      example: weekday_wakeup
+      selector:
+        text:
+    time:
+      name: Time
+      description: Fire time. Accepts "06:30", "6:30am", "5pm", "noon".
+      required: true
+      example: "6:30am"
+      selector:
+        text:
+    days:
+      name: Days
+      description: 'Recurrence pattern: "once", "daily", "weekdays", "weekends", or a list like ["mon","wed","fri"].'
+      required: false
+      default: once
+      example: weekdays
+      selector:
+        text:
+    sound_file:
+      name: Sound file
+      description: Filename in /config/alarm_sounds. Falls back to default.
+      required: false
+      example: rooster.mp3
+      selector:
+        text:
+    media_player:
+      name: Media player
+      description: Entity ID of the speaker. Falls back to configured default.
+      required: false
+      example: media_player.bedroom
+      selector:
+        entity:
+          domain: media_player
+    volume:
+      name: Target volume
+      description: Volume to settle at after ramping (0.0 - 1.0).
+      required: false
+      example: 0.7
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.05
+    ramp_duration:
+      name: Ramp duration (seconds)
+      description: How long to ramp from start to target volume. 0 disables ramping.
+      required: false
+      example: 30
+      selector:
+        number:
+          min: 0
+          max: 600
+          step: 1
+    ramp_start:
+      name: Ramp start volume
+      description: Initial volume when ramping begins (0.0 - 1.0).
+      required: false
+      example: 0.1
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.05
+    loop:
+      name: Loop
+      description: Replay the sound until dismissed.
+      required: false
+      example: true
+      selector:
+        boolean:
+    enabled:
+      name: Enabled
+      description: When false, the alarm is stored but not scheduled.
+      required: false
+      default: true
+      selector:
+        boolean:
+    one_shot_date:
+      name: One-shot date
+      description: ISO date (YYYY-MM-DD) for a once-only alarm. Only used when days is "once".
+      required: false
+      example: "2026-05-04"
+      selector:
+        text:
+
+cancel:
+  name: Cancel alarm
+  description: Remove an alarm definition and any pending Simple Cue triggers.
+  fields:
+    name:
+      name: Name
+      required: true
+      selector:
+        text:
+
+snooze:
+  name: Snooze alarm
+  description: Stop ringing now, fire again in N minutes.
+  fields:
+    name:
+      name: Name
+      required: true
+      selector:
+        text:
+    minutes:
+      name: Minutes
+      description: Snooze duration.
+      required: false
+      default: 9
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+
+dismiss:
+  name: Dismiss alarm
+  description: Stop the currently ringing alarm. Recurring alarms continue on schedule.
+  fields:
+    name:
+      name: Name
+      required: true
+      selector:
+        text:
+
+ring:
+  name: Ring alarm (internal)
+  description: Triggered by Simple Cue when an alarm fires. Plays media and re-queues recurrence.
+  fields:
+    name:
+      name: Name
+      required: true
+      selector:
+        text:
+    was_snooze:
+      name: Was snooze
+      required: false
+      selector:
+        boolean:

@@ -1,0 +1,39 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Alarm Clock",
+        "description": "Configure the alarm clock defaults. Drop sound files into /config/alarm_sounds.",
+        "data": {
+          "mcp_port": "MCP server port",
+          "default_media_player": "Default media player",
+          "default_sound": "Default sound file (filename in /config/alarm_sounds)",
+          "default_loop": "Loop sound until dismissed by default",
+          "default_volume": "Default target volume (0.0 - 1.0)",
+          "default_ramp_duration": "Volume ramp duration in seconds (0 to disable)",
+          "default_ramp_start": "Volume ramp start level (0.0 - 1.0)"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one Alarm Clock instance is supported."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Alarm Clock",
+        "description": "Edit the alarm clock defaults.",
+        "data": {
+          "mcp_port": "MCP server port",
+          "default_media_player": "Default media player",
+          "default_sound": "Default sound file",
+          "default_loop": "Loop by default",
+          "default_volume": "Default target volume",
+          "default_ramp_duration": "Volume ramp duration (s)",
+          "default_ramp_start": "Volume ramp start level"
+        }
+      }
+    }
+  }
+}
