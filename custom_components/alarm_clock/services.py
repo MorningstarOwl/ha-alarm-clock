@@ -35,6 +35,24 @@ from .media import MediaController, resolve_sound_path
 
 _LOGGER = logging.getLogger(__name__)
 
+
+async def _notify_misconfig(hass: HomeAssistant, alarm_name: str, message: str) -> None:
+    """Log + raise a persistent_notification so silent-fire failures are visible."""
+    _LOGGER.error("Alarm %s could not ring: %s", alarm_name, message)
+    try:
+        await hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": f"Alarm '{alarm_name}' could not ring",
+                "message": message,
+                "notification_id": f"alarm_clock_misconfig_{alarm_name}",
+            },
+            blocking=False,
+        )
+    except Exception:  # pragma: no cover - notifications are best-effort
+        pass
+
 SET_SCHEMA = vol.Schema(
     {
         vol.Required(ATTR_NAME): str,
@@ -123,15 +141,23 @@ async def async_register_services(hass: HomeAssistant) -> None:
 
         media_player = alarm.media_player or manager.defaults.get("default_media_player")
         if not media_player:
-            _LOGGER.error("Alarm %s has no media_player configured", name)
+            await _notify_misconfig(
+                hass,
+                name,
+                "No media player is configured. Set one on the alarm or in the "
+                "Alarm Clock integration options.",
+            )
             return
 
         sound_path = resolve_sound_path(
             alarm.sound_file, manager.defaults.get("default_sound")
         )
         if sound_path is None:
-            _LOGGER.error(
-                "Alarm %s: no playable sound file in /config/alarm_sounds", name
+            await _notify_misconfig(
+                hass,
+                name,
+                "No playable sound file was found. Drop an .mp3/.wav/.ogg file "
+                "into /config/alarm_sounds and try again.",
             )
             return
 

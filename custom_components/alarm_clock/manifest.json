@@ -1,7 +1,7 @@
 {
   "domain": "alarm_clock",
   "name": "Alarm Clock",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "documentation": "https://github.com/MorningstarOwl/ha-alarm-clock",
   "issue_tracker": "https://github.com/MorningstarOwl/ha-alarm-clock/issues",
   "codeowners": ["@MorningstarOwl"],

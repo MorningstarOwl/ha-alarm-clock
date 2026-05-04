@@ -23,7 +23,12 @@ _LOGGER = logging.getLogger(__name__)
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus"}
 QUIESCENT_STATES = {STATE_IDLE, STATE_OFF, STATE_PAUSED, "standby", "stopped"}
+PLAYING_STATES = {"playing", "buffering"}
 RAMP_STEPS = 20
+# Minimum seconds between consecutive replays for a single ringing alarm.
+# Guards against feedback loops if a media player rapidly toggles state
+# (e.g. when a file fails to play and the player stays/returns to idle).
+REPLAY_MIN_INTERVAL = 5.0
 
 
 def list_sound_files() -> list[str]:
@@ -69,6 +74,8 @@ class RingHandle:
     media_player: str
     ramp_task: asyncio.Task | None = None
     loop_unsub: callable | None = None
+    has_played: bool = False  # true once the player has entered a PLAYING_STATES
+    last_replay_at: float = 0.0  # monotonic timestamp of the last replay dispatch
 
     def cancel(self) -> None:
         if self.ramp_task and not self.ramp_task.done():
@@ -176,17 +183,41 @@ class MediaController:
     def _install_loop_watcher(
         self, name: str, media_player: str, sound_path: str
     ):
-        """Replay the sound whenever the media player goes idle."""
+        """Replay the sound on a clean playing→idle transition.
+
+        Guards against three failure modes that previously could feedback-loop:
+        - attribute-only state changes (e.g. volume_set during ramping) re-firing
+          the watcher
+        - replaying when the player never reached "playing" (e.g. a broken file
+          path leaves it stuck in idle and we'd spin)
+        - replays issued faster than REPLAY_MIN_INTERVAL
+        """
 
         @callback
         def _on_state(event) -> None:
             new_state: State | None = event.data.get("new_state")
+            old_state: State | None = event.data.get("old_state")
             if new_state is None:
                 return
-            if name not in self._handles:
+            handle = self._handles.get(name)
+            if handle is None:
                 return
-            if new_state.state in QUIESCENT_STATES:
-                # Re-issue play_media; volume stays at whatever the ramp left it.
-                self.hass.async_create_task(self._play_media(media_player, sound_path))
+            # Ignore attribute-only updates; only act on actual state transitions.
+            if old_state is not None and old_state.state == new_state.state:
+                return
+            if new_state.state in PLAYING_STATES:
+                handle.has_played = True
+                return
+            if new_state.state not in QUIESCENT_STATES:
+                return
+            if not handle.has_played:
+                # Player never reached playback — don't try again or we'll spin.
+                return
+            now = self.hass.loop.time()
+            if now - handle.last_replay_at < REPLAY_MIN_INTERVAL:
+                return
+            handle.last_replay_at = now
+            handle.has_played = False  # require another playing→idle cycle
+            self.hass.async_create_task(self._play_media(media_player, sound_path))
 
         return async_track_state_change_event(self.hass, [media_player], _on_state)
