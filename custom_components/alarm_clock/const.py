@@ -10,13 +10,13 @@ STORAGE_VERSION = 1
 # Sound files folder (always /config/alarm_sounds inside HA)
 SOUND_FOLDER = "/config/alarm_sounds"
 
-# Simple Cue cue-name namespace
-CUE_PREFIX = "alarm_clock__"
+# Internal scheduler key namespace (was CUE_PREFIX in v0.1.x when we
+# delegated to Simple Cue; kept the same string for log continuity).
+KEY_PREFIX = "alarm_clock__"
 SNOOZE_SUFFIX = "__snooze"
 
 # Events
 EVENT_TRIGGERED = "alarm_clock_triggered"
-EVENT_SIMPLE_CUE_TRIGGERED = "simple_cue_triggered"
 
 # Services
 SERVICE_SET = "set"

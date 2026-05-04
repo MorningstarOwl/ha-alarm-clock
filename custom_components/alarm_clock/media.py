@@ -11,6 +11,7 @@ from homeassistant.components.media_player import (
     ATTR_MEDIA_CONTENT_ID,
     ATTR_MEDIA_CONTENT_TYPE,
     DOMAIN as MEDIA_PLAYER_DOMAIN,
+    MediaPlayerEntityFeature,
     SERVICE_PLAY_MEDIA,
 )
 from homeassistant.const import ATTR_ENTITY_ID, STATE_IDLE, STATE_OFF, STATE_PAUSED
@@ -76,6 +77,7 @@ class RingHandle:
     loop_unsub: callable | None = None
     has_played: bool = False  # true once the player has entered a PLAYING_STATES
     last_replay_at: float = 0.0  # monotonic timestamp of the last replay dispatch
+    used_native_repeat: bool = False  # we set repeat=all on the player
 
     def cancel(self) -> None:
         if self.ramp_task and not self.ramp_task.done():
@@ -114,9 +116,20 @@ class MediaController:
         handle = RingHandle(name=name, media_player=media_player)
         self._handles[name] = handle
 
+        # Decide how to handle looping. When the player supports REPEAT_SET
+        # natively (Music Assistant, MPD, Squeezelite, most modern players)
+        # the cleanest approach is to set repeat=all and play once. The
+        # state-transition watcher is a fallback for players that don't.
+        use_native_repeat = loop and self._supports_repeat(media_player)
+
         # Set initial volume before playback so the first beat lands at the right level
         initial_volume = ramp_start if ramp_duration > 0 else target_volume
         await self._set_volume(media_player, initial_volume)
+
+        if use_native_repeat:
+            await self._set_repeat(media_player, "all")
+            handle.used_native_repeat = True
+
         await self._play_media(media_player, sound_path)
 
         if ramp_duration > 0 and target_volume > ramp_start:
@@ -124,7 +137,9 @@ class MediaController:
                 self._ramp(media_player, ramp_start, target_volume, ramp_duration)
             )
 
-        if loop:
+        # Only install the state-change watcher if loop is requested AND
+        # we couldn't satisfy it via native repeat.
+        if loop and not use_native_repeat:
             handle.loop_unsub = self._install_loop_watcher(name, media_player, sound_path)
 
     async def stop_ring(self, name: str) -> None:
@@ -133,6 +148,9 @@ class MediaController:
         if handle is None:
             return
         handle.cancel()
+        if handle.used_native_repeat:
+            # Restore the player's loop mode so non-alarm playback isn't sticky.
+            await self._set_repeat(handle.media_player, "off")
         try:
             await self.hass.services.async_call(
                 MEDIA_PLAYER_DOMAIN,
@@ -142,6 +160,21 @@ class MediaController:
             )
         except Exception as err:  # pragma: no cover - defensive
             _LOGGER.debug("media_stop failed for %s: %s", handle.media_player, err)
+
+    # ------------------------------------------------------------------
+    # Service helpers
+    # ------------------------------------------------------------------
+
+    def _supports_repeat(self, media_player: str) -> bool:
+        """Best-effort capability probe for media_player.repeat_set."""
+        state = self.hass.states.get(media_player)
+        if state is None:
+            return False
+        try:
+            features = int(state.attributes.get("supported_features") or 0)
+        except (TypeError, ValueError):
+            return False
+        return bool(features & MediaPlayerEntityFeature.REPEAT_SET)
 
     async def _play_media(self, media_player: str, sound_path: str) -> None:
         await self.hass.services.async_call(
@@ -167,6 +200,18 @@ class MediaController:
         except Exception as err:  # pragma: no cover - defensive
             _LOGGER.debug("volume_set failed for %s: %s", media_player, err)
 
+    async def _set_repeat(self, media_player: str, mode: str) -> None:
+        """Set repeat mode (all/one/off). Best-effort; errors are logged only."""
+        try:
+            await self.hass.services.async_call(
+                MEDIA_PLAYER_DOMAIN,
+                "repeat_set",
+                {ATTR_ENTITY_ID: media_player, "repeat": mode},
+                blocking=False,
+            )
+        except Exception as err:  # pragma: no cover - defensive
+            _LOGGER.debug("repeat_set %s failed for %s: %s", mode, media_player, err)
+
     async def _ramp(
         self, media_player: str, start: float, end: float, duration: int
     ) -> None:
@@ -179,6 +224,10 @@ class MediaController:
                 await self._set_volume(media_player, start + delta * i)
         except asyncio.CancelledError:
             pass
+
+    # ------------------------------------------------------------------
+    # Fallback loop watcher (only used when REPEAT_SET is unsupported)
+    # ------------------------------------------------------------------
 
     def _install_loop_watcher(
         self, name: str, media_player: str, sound_path: str

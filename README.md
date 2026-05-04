@@ -1,15 +1,14 @@
 # Alarm Clock
 
-A Home Assistant companion to [Simple Cue](https://github.com/MorningstarOwl/simple-cue) — wake-up style alarms with custom ringtones, recurrence patterns, configurable volume ramping, looping playback, and a built-in MCP SSE server so the Assist LLM can manage alarms by voice.
+A self-contained Home Assistant alarm-clock integration with custom ringtones, recurrence patterns, configurable volume ramping, looping playback, and a built-in MCP SSE server so the Assist LLM can manage alarms by voice.
 
-This integration **doesn't schedule timers itself**. It manages alarm *definitions* and creates Simple Cue triggers for each occurrence. Simple Cue handles the scheduling; this integration adds recurrence, media playback, and alarm-clock UX on top.
+Scheduling is handled natively via `async_track_point_in_time` — no external scheduler dependency.
 
 ---
 
 ## Requirements
 
 - Home Assistant 2024.6 or newer
-- [Simple Cue](https://github.com/MorningstarOwl/simple-cue) installed and configured
 - A media player entity for playback (any HA-integrated speaker)
 
 ---
@@ -30,7 +29,7 @@ Sound files go in `/config/alarm_sounds/` — the folder is created automaticall
 
 | Value | Behavior |
 |---|---|
-| `once` | Single fire; alarm definition is removed after firing |
+| `once` | Single fire; alarm definition is removed when dismissed or cancelled |
 | `daily` | Every day |
 | `weekdays` | Mon–Fri |
 | `weekends` | Sat, Sun |
@@ -82,7 +81,7 @@ data:
 
 ### `alarm_clock.snooze`
 
-Stops the current ring and schedules a one-shot Simple Cue trigger N minutes from now. The next regular occurrence is unaffected.
+Stops the current ring and arms a one-shot fire N minutes from now. The next regular occurrence is unaffected.
 
 | Field | Default | Description |
 |---|---|---|
@@ -91,11 +90,11 @@ Stops the current ring and schedules a one-shot Simple Cue trigger N minutes fro
 
 ### `alarm_clock.dismiss`
 
-Stops the current ring. Recurring alarms keep their next-fire schedule.
+Stops the current ring. Recurring alarms keep their next-fire schedule; one-shot alarms are removed.
 
 ### `alarm_clock.ring`
 
-Internal — Simple Cue calls this when an alarm fires. Safe to call manually for testing.
+Internal — invoked by the integration's own scheduler when an alarm fires. Safe to call manually for testing.
 
 ---
 
@@ -112,10 +111,6 @@ State is the number of configured alarms. Attribute `alarms` is a `name → next
 ### `binary_sensor.alarm_clock_ringing_{name}`
 
 `on` while an alarm is actively ringing. Useful for triggering automations such as "turn on the bedroom lights when the alarm rings."
-
-### `sensor.simple_cue_alarm_clock__{name}`
-
-Auto-created by Simple Cue. Shows the live countdown to the next fire.
 
 ---
 
@@ -150,7 +145,9 @@ The ramp is cancelled when the alarm is snoozed or dismissed.
 
 ## Looping
 
-When `loop: true`, the integration listens for the media player to enter `idle` / `off` / `paused` / `stopped` and re-issues `media_player.play_media` until the alarm is snoozed or dismissed. The watcher is torn down cleanly on stop.
+When `loop: true` and the target media player advertises the `REPEAT_SET` feature (Music Assistant, MPD, Squeezelite, most modern players), the integration sets `repeat_set: all` before starting playback and lets the player loop natively. On stop, repeat is set back to `off` so non-alarm playback isn't sticky.
+
+For players that don't support repeat, the integration falls back to a state-change watcher: when the player transitions from `playing` to a quiescent state, it re-issues `media_player.play_media`. The watcher debounces to one replay every 5 seconds and won't replay if the player never reached a `playing` state at all.
 
 ---
 
@@ -197,22 +194,26 @@ alarm_clock.set service
 AlarmManager.async_set:
   - stores definition in .storage/alarm_clock
   - calculates next occurrence
-  - calls simple_cue.set with action: alarm_clock.ring
+  - arms async_track_point_in_time(_fire, when)
 
-[Simple Cue waits for the time]
+[HA waits for the time]
   ↓ fires
+AlarmManager._fire (callback):
+  - dispatches alarm_clock.ring service
+
 alarm_clock.ring service:
   - looks up the stored alarm
   - MediaController.start_ring:
       • set initial (ramp_start) volume
+      • set repeat=all if supported, else install loop watcher
       • play_media
       • async ramp task to target volume
-      • state-change listener for looping
-  - re-queues NEXT occurrence via simple_cue.set
+  - calls AlarmManager.async_handle_fire to queue the next regular
+    occurrence (recurring) or clear next_fire (one-shot)
   - fires alarm_clock_triggered event
 ```
 
-On HA startup, `async_reconcile()` re-queues Simple Cue triggers for every enabled alarm so nothing is lost across restarts.
+On HA startup, `async_reconcile()` walks every enabled alarm and re-arms its timer (timers don't survive restart). Any one-shot whose date+time has already passed is dropped at this point so storage stays clean.
 
 ---
 
@@ -224,15 +225,32 @@ On HA startup, `async_reconcile()` re-queues Simple Cue triggers for every enabl
 - Look in **Settings → System → Logs** for `alarm_clock` errors
 
 **Alarm doesn't fire**
-- Verify Simple Cue is installed and `sensor.simple_cue_alarm_clock__{name}` exists
-- Check **Developer Tools → Events** and listen for `simple_cue_triggered`
+- Check `sensor.alarm_clock_{name}` — its state should be the upcoming ISO datetime
+- If `next_fire` is `None`, the recurrence pattern produced no future match (e.g. an expired one-shot)
+- Enable debug logging for the integration to see arm/disarm events:
+  ```yaml
+  logger:
+    logs:
+      custom_components.alarm_clock: debug
+  ```
 
 **Looping doesn't work**
-- Some media players don't transition to a recognized "idle" state when a track ends. If looping fails, set `loop: false` and use a longer/looped audio file directly.
+- The integration auto-detects native `repeat_set` support. If your player advertises the feature but doesn't honor it, set `loop: false` and use a longer/looped audio file directly.
+- For players without repeat support, the fallback watcher needs the player to transition cleanly from `playing` to `idle`/`paused`/`off`. Some players hang on `unknown` instead — set `loop: false` if that's the case.
 
 **MCP client can't connect**
 - Confirm the port matches your config flow setting (default `8778`)
-- Confirm Simple Cue's MCP server is on a different port (default `8777`)
+- The MCP SSE server lives inside Home Assistant — check **Settings → System → Logs** for FastMCP startup errors
+
+---
+
+## Upgrading from 0.1.x
+
+Versions before 0.2.0 used [Simple Cue](https://github.com/MorningstarOwl/simple-cue) as the scheduler. Starting with 0.2.0 the integration schedules natively and no longer depends on Simple Cue.
+
+The upgrade is in-place — alarm definitions stored under v0.1.x load and re-arm automatically. On first start of v0.2.0, the integration also issues a best-effort `simple_cue.cancel` for each `alarm_clock__{name}` cue so your alarms don't double-fire while Simple Cue still has stale entries. If you've already removed Simple Cue, that's a no-op.
+
+You can keep Simple Cue installed alongside Alarm Clock — the two are now fully independent.
 
 ---
 

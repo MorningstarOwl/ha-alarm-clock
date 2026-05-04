@@ -1,12 +1,19 @@
-"""Core alarm-definition store + Simple Cue scheduling bridge."""
+"""Alarm definition store + native HA scheduling.
+
+Owns the persistent alarm definitions and arms ``async_track_point_in_time``
+callbacks for each occurrence. When a timer fires it dispatches the
+``alarm_clock.ring`` service so all media/event/dispatcher work lives in one
+place (services.py).
+"""
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.event import async_track_point_in_time
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
 
@@ -16,7 +23,6 @@ from .const import (
     ATTR_LOOP,
     ATTR_MEDIA_PLAYER,
     ATTR_NAME,
-    ATTR_NEXT_FIRE,
     ATTR_ONE_SHOT_DATE,
     ATTR_RAMP_DURATION,
     ATTR_RAMP_START,
@@ -29,13 +35,14 @@ from .const import (
     CONF_DEFAULT_RAMP_START,
     CONF_DEFAULT_SOUND,
     CONF_DEFAULT_VOLUME,
-    CUE_PREFIX,
     DEFAULT_LOOP,
     DEFAULT_RAMP_DURATION,
     DEFAULT_RAMP_START,
     DEFAULT_VOLUME,
     DOMAIN,
+    KEY_PREFIX,
     PATTERN_ONCE,
+    SERVICE_RING,
     SNOOZE_SUFFIX,
     STORAGE_KEY,
     STORAGE_VERSION,
@@ -47,6 +54,8 @@ _LOGGER = logging.getLogger(__name__)
 
 @dataclass
 class Alarm:
+    """A single alarm definition. Persisted to .storage/alarm_clock.alarms."""
+
     name: str
     time: str
     days: Any  # str pattern or list[str]
@@ -68,36 +77,27 @@ class Alarm:
         return cls(**{k: v for k, v in data.items() if k in cls.__annotations__})
 
 
-def cue_name(alarm_name: str) -> str:
-    return f"{CUE_PREFIX}{alarm_name}"
+def _main_key(alarm_name: str) -> str:
+    """Internal scheduler key for the regular fire of an alarm."""
+    return f"{KEY_PREFIX}{alarm_name}"
 
 
-def snooze_cue_name(alarm_name: str) -> str:
-    return f"{CUE_PREFIX}{alarm_name}{SNOOZE_SUFFIX}"
-
-
-def cue_to_alarm_name(cue: str) -> str | None:
-    """Reverse: alarm_clock__weekday_wakeup → weekday_wakeup. Strips snooze suffix."""
-    if not cue.startswith(CUE_PREFIX):
-        return None
-    rest = cue[len(CUE_PREFIX):]
-    if rest.endswith(SNOOZE_SUFFIX):
-        rest = rest[: -len(SNOOZE_SUFFIX)]
-    return rest or None
-
-
-def is_snooze_cue(cue: str) -> bool:
-    return cue.startswith(CUE_PREFIX) and cue.endswith(SNOOZE_SUFFIX)
+def _snooze_key(alarm_name: str) -> str:
+    """Internal scheduler key for a pending snooze fire."""
+    return f"{KEY_PREFIX}{alarm_name}{SNOOZE_SUFFIX}"
 
 
 class AlarmManager:
-    """Persistent store + Simple Cue scheduler glue."""
+    """Persistent definition store + ``async_track_point_in_time`` scheduler."""
 
     def __init__(self, hass: HomeAssistant, defaults: dict[str, Any]) -> None:
         self.hass = hass
         self.defaults = defaults
         self._store: Store = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._alarms: dict[str, Alarm] = {}
+        # Scheduler keys -> async_track_point_in_time unsub callbacks.
+        # Two keys per alarm at most: the main fire and an outstanding snooze.
+        self._unsubs: dict[str, CALLBACK_TYPE] = {}
 
     @property
     def alarms(self) -> dict[str, Alarm]:
@@ -119,12 +119,22 @@ class AlarmManager:
             {"alarms": {n: a.to_dict() for n, a in self._alarms.items()}}
         )
 
+    @callback
+    def async_unload(self) -> None:
+        """Cancel all in-flight timers. Called from async_unload_entry."""
+        for unsub in list(self._unsubs.values()):
+            try:
+                unsub()
+            except Exception:  # pragma: no cover - defensive
+                pass
+        self._unsubs.clear()
+
     # ------------------------------------------------------------------
     # Definition mutations
     # ------------------------------------------------------------------
 
     async def async_set(self, payload: dict[str, Any]) -> Alarm:
-        """Create or replace an alarm and queue its next Simple Cue trigger."""
+        """Create or replace an alarm and arm its next fire."""
         name = payload[ATTR_NAME]
         days = normalize_days(payload.get(ATTR_DAYS, PATTERN_ONCE))
 
@@ -139,7 +149,9 @@ class AlarmManager:
             or self.defaults.get(CONF_DEFAULT_MEDIA_PLAYER)
             or None,
             volume=float(
-                payload.get(ATTR_VOLUME, self.defaults.get(CONF_DEFAULT_VOLUME, DEFAULT_VOLUME))
+                payload.get(
+                    ATTR_VOLUME, self.defaults.get(CONF_DEFAULT_VOLUME, DEFAULT_VOLUME)
+                )
             ),
             ramp_duration=int(
                 payload.get(
@@ -160,10 +172,10 @@ class AlarmManager:
             one_shot_date=payload.get(ATTR_ONE_SHOT_DATE),
         )
 
-        # Replace any existing instance + cancel its outstanding cue
+        # Replace any existing instance + cancel its timers
         if name in self._alarms:
-            await self._cancel_cue(cue_name(name))
-            await self._cancel_cue(snooze_cue_name(name))
+            self._disarm(_main_key(name))
+            self._disarm(_snooze_key(name))
 
         self._alarms[name] = alarm
 
@@ -174,89 +186,100 @@ class AlarmManager:
         return alarm
 
     async def async_cancel(self, name: str) -> bool:
-        """Remove an alarm definition and its outstanding cues."""
+        """Remove an alarm definition and its outstanding timers."""
         if name not in self._alarms:
             return False
-        await self._cancel_cue(cue_name(name))
-        await self._cancel_cue(snooze_cue_name(name))
+        self._disarm(_main_key(name))
+        self._disarm(_snooze_key(name))
         self._alarms.pop(name, None)
         await self.async_save()
         return True
 
     # ------------------------------------------------------------------
-    # Lifecycle: ring, snooze, dismiss
+    # Lifecycle: post-fire bookkeeping, snooze, dismiss
     # ------------------------------------------------------------------
 
     async def async_handle_fire(self, alarm_name: str, was_snooze: bool) -> Alarm | None:
-        """Called when Simple Cue triggers one of our cues. Re-queues the next.
+        """Called by services._ring after media has started.
 
-        Returns the alarm definition (so the service layer can play media).
+        For recurring alarms: queue the next regular occurrence.
+        For one-shots: clear next_fire but keep the definition until
+        explicitly dismissed/cancelled, so the user can still snooze.
         """
         alarm = self._alarms.get(alarm_name)
         if alarm is None:
             return None
 
-        if alarm.days == PATTERN_ONCE and not was_snooze:
-            # One-shot fired — remove the definition entirely
-            self._alarms.pop(alarm_name, None)
+        if alarm.days == PATTERN_ONCE:
             alarm.next_fire = None
             await self.async_save()
             return alarm
 
-        # Recurring (or snooze): queue the *next regular* occurrence
         if alarm.enabled:
-            await self._schedule_next(alarm, after=dt_util.now() + timedelta(seconds=1))
+            await self._schedule_next(
+                alarm, after=dt_util.now() + timedelta(seconds=1)
+            )
         await self.async_save()
         return alarm
 
     async def async_snooze(self, alarm_name: str, minutes: int) -> bool:
-        """Schedule a snooze cue N minutes from now."""
+        """Arm a one-shot snooze fire N minutes from now."""
         if alarm_name not in self._alarms:
             return False
         fire_at = dt_util.now() + timedelta(minutes=minutes)
-        await self._cancel_cue(snooze_cue_name(alarm_name))
-        await self._call_simple_cue_set(
-            cue_name=snooze_cue_name(alarm_name),
-            when=fire_at,
-            alarm_name=alarm_name,
-            was_snooze=True,
-        )
+        self._arm(_snooze_key(alarm_name), fire_at, alarm_name, was_snooze=True)
         return True
 
     async def async_dismiss(self, alarm_name: str) -> bool:
-        """Cancel any pending snooze. Media stop is handled by the service layer."""
-        await self._cancel_cue(snooze_cue_name(alarm_name))
-        return alarm_name in self._alarms
+        """Cancel any pending snooze. One-shot definitions are removed."""
+        self._disarm(_snooze_key(alarm_name))
+        alarm = self._alarms.get(alarm_name)
+        if alarm is None:
+            return False
+        if alarm.days == PATTERN_ONCE:
+            self._alarms.pop(alarm_name, None)
+            await self.async_save()
+        return True
 
     # ------------------------------------------------------------------
-    # Reconciliation (called after HA restart)
+    # Reconciliation (called after HA startup)
     # ------------------------------------------------------------------
 
     async def async_reconcile(self) -> None:
-        """Ensure every enabled alarm has a future Simple Cue trigger queued."""
+        """Re-arm timers for every enabled alarm; drop expired one-shots."""
         now = dt_util.now()
+        to_drop: list[str] = []
         for alarm in list(self._alarms.values()):
             if not alarm.enabled:
+                alarm.next_fire = None
                 continue
-            # Always recompute — Simple Cue's storage is authoritative for
-            # future fires, but re-issuing set() is idempotent (it replaces).
             await self._schedule_next(alarm, after=now)
+            if alarm.next_fire is None and alarm.days == PATTERN_ONCE:
+                to_drop.append(alarm.name)
+
+        for name in to_drop:
+            self._alarms.pop(name, None)
+            _LOGGER.info("Dropped stale one-shot alarm: %s", name)
+
         await self.async_save()
 
     # ------------------------------------------------------------------
-    # Internals
+    # Internals: scheduling primitives
     # ------------------------------------------------------------------
 
     async def _schedule_next(
         self, alarm: Alarm, after: datetime | None = None
     ) -> None:
+        """Compute the next fire time and arm a timer for it."""
         after = after or dt_util.now()
         one_shot_date = None
         if alarm.one_shot_date:
             try:
                 one_shot_date = datetime.fromisoformat(alarm.one_shot_date).date()
             except ValueError:
-                _LOGGER.warning("Bad one_shot_date for %s: %s", alarm.name, alarm.one_shot_date)
+                _LOGGER.warning(
+                    "Bad one_shot_date for %s: %s", alarm.name, alarm.one_shot_date
+                )
 
         try:
             fire_at = next_occurrence(
@@ -267,51 +290,55 @@ class AlarmManager:
             return
 
         if fire_at is None:
-            _LOGGER.info("Alarm %s has no future occurrence; skipping schedule", alarm.name)
+            _LOGGER.info("Alarm %s has no future occurrence", alarm.name)
             alarm.next_fire = None
+            self._disarm(_main_key(alarm.name))
             return
 
         alarm.next_fire = fire_at.isoformat()
-        await self._call_simple_cue_set(
-            cue_name=cue_name(alarm.name),
-            when=fire_at,
-            alarm_name=alarm.name,
-        )
+        self._arm(_main_key(alarm.name), fire_at, alarm.name)
 
-    async def _call_simple_cue_set(
+    @callback
+    def _arm(
         self,
-        cue_name: str,
+        key: str,
         when: datetime,
         alarm_name: str,
         was_snooze: bool = False,
     ) -> None:
-        """Ask Simple Cue to schedule a cue that calls our alarm_clock.ring service."""
-        ring_data: dict[str, Any] = {"name": alarm_name}
-        if was_snooze:
-            ring_data["was_snooze"] = True
-        await self.hass.services.async_call(
-            "simple_cue",
-            "set",
-            {
-                "name": cue_name,
-                "datetime": when.isoformat(),
-                "action": [
-                    {
-                        "action": f"{DOMAIN}.ring",
-                        "data": ring_data,
-                    }
-                ],
-            },
-            blocking=True,
-        )
+        """Schedule a fire callback under ``key``; replaces any existing one."""
+        self._disarm(key)
 
-    async def _cancel_cue(self, cue_name: str) -> None:
+        @callback
+        def _fire(_now: datetime) -> None:
+            # async_track_point_in_time auto-unregisters after firing,
+            # but our dict still holds the (now-stale) unsub. Drop it.
+            self._unsubs.pop(key, None)
+            self.hass.async_create_task(
+                self._dispatch_ring(alarm_name, was_snooze)
+            )
+
+        self._unsubs[key] = async_track_point_in_time(self.hass, _fire, when)
+        _LOGGER.debug("Armed %s for %s", key, when.isoformat())
+
+    @callback
+    def _disarm(self, key: str) -> None:
+        """Cancel the timer registered under ``key`` if any."""
+        unsub = self._unsubs.pop(key, None)
+        if unsub:
+            try:
+                unsub()
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+    async def _dispatch_ring(self, alarm_name: str, was_snooze: bool) -> None:
+        """Call the alarm_clock.ring service when a timer fires."""
         try:
             await self.hass.services.async_call(
-                "simple_cue",
-                "cancel",
-                {"name": cue_name},
-                blocking=True,
+                DOMAIN,
+                SERVICE_RING,
+                {ATTR_NAME: alarm_name, "was_snooze": was_snooze},
+                blocking=False,
             )
-        except Exception as err:
-            _LOGGER.debug("simple_cue.cancel for %s failed (likely not set): %s", cue_name, err)
+        except Exception:  # pragma: no cover - defensive
+            _LOGGER.exception("Failed to dispatch ring for %s", alarm_name)
